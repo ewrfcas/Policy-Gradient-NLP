@@ -301,7 +301,7 @@ if __name__ == '__main__':
     print('init model...')
 
     model = BertForUniLM(bert_config)
-    utils.torch_init_model(model, args.init_restore_dir)
+    utils.torch_init_model(model, args.init_restore_dir, key='model')
     model.to(device)
 
     # Prepare optimizer and schedule (linear warmup and decay)
