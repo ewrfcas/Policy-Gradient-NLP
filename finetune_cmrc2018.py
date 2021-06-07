@@ -5,12 +5,11 @@ import numpy as np
 import json
 import torch
 import utils
-from src.pytorch_modeling import BertConfig, BertForQuestionAnswering
+from src.pytorch_modeling import BertConfig, BertForQuestionAnswering, BertForQA_PG
 from src.pytorch_optimization import AdamW, get_linear_schedule_with_warmup
 from src.cmrc2018_output import write_predictions
 from src.cmrc2018_evaluate import get_eval
 import collections
-from torch import nn
 from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
 import src.official_tokenization as tokenization
@@ -85,12 +84,12 @@ def evaluate(model, args, eval_examples, eval_features, device, global_steps,
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gpu_ids', type=str, default='1')
+    parser.add_argument('--gpu_ids', type=str, default='2')
 
     # training parameter
-    parser.add_argument('--train_epochs', type=int, default=2)
+    parser.add_argument('--train_epochs', type=int, default=3)
     parser.add_argument('--n_batch', type=int, default=16)
-    parser.add_argument('--lr', type=float, default=5e-6)
+    parser.add_argument('--lr', type=float, default=3e-5)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--clip_norm', type=float, default=1.0)
     parser.add_argument('--warmup_rate', type=float, default=0.1)
@@ -99,9 +98,13 @@ if __name__ == '__main__':
     parser.add_argument('--float16', type=bool, default=True)  # only sm >= 7.0 (tensorcores)
     parser.add_argument('--max_ans_length', type=int, default=50)
     parser.add_argument('--n_best', type=int, default=20)
-    parser.add_argument('--eval_epochs', type=float, default=0.25)
+    parser.add_argument('--eval_epochs', type=float, default=0.2)
     parser.add_argument('--save_best', type=bool, default=True)
     parser.add_argument('--vocab_size', type=int, default=21128)  # 21128, 8021
+    parser.add_argument('--pg', default=False, action='store_true')
+    parser.add_argument('--pg_warmup', default=0.1)
+    parser.add_argument('--rl_weight', type=float, default=0.5)
+    parser.add_argument('--trainable_weight', type=bool, default=False)
 
     # data dir
     parser.add_argument('--train_dir', type=str,
@@ -120,10 +123,12 @@ if __name__ == '__main__':
                         default='pretrained_models/bert-wwm-ext/bert_config.json')
     parser.add_argument('--vocab_file', type=str,
                         default='pretrained_models/bert-wwm-ext/vocab.txt')
+    # parser.add_argument('--init_restore_dir', type=str,
+    #                     default='check_points/roberta_cmrc2018_V3/best_model.pth')
     parser.add_argument('--init_restore_dir', type=str,
-                        default='check_points/roberta_cmrc2018_V0/best_model.pth')
+                        default='pretrained_models/bert-wwm-ext/pytorch_model.bin')
     parser.add_argument('--checkpoint_dir', type=str,
-                        default='check_points/roberta_cmrc2018_V1/')
+                        default='check_points/roberta_cmrc2018_V0/')
     parser.add_argument('--setting_file', type=str, default='setting.txt')
     parser.add_argument('--log_file', type=str, default='log.txt')
 
@@ -159,8 +164,10 @@ if __name__ == '__main__':
                       max_seq_length=bert_config.max_position_embeddings)
 
     train_features = json.load(open(args.train_dir, 'r'))
-    dev_examples = json.load(open(args.dev_dir.replace('_features', '_examples'), 'r'))
-    dev_features = json.load(open(args.dev_dir, 'r'))
+    # dev_examples = json.load(open(args.dev_dir.replace('_features', '_examples'), 'r'))
+    # dev_features = json.load(open(args.dev_dir, 'r'))
+    dev_examples = json.load(open(args.test_dir.replace('_features', '_examples'), 'r'))
+    dev_features = json.load(open(args.test_dir, 'r'))
     test_examples = json.load(open(args.test_dir.replace('_features', '_examples'), 'r'))
     test_features = json.load(open(args.test_dir, 'r'))
     if os.path.exists(args.log_file):
@@ -171,6 +178,9 @@ if __name__ == '__main__':
     if len(train_features) % args.n_batch != 0:
         steps_per_epoch += 1
     total_steps = steps_per_epoch * args.train_epochs
+    pg_steps = int(steps_per_epoch * args.pg_warmup)
+
+    args.dev_file = args.test_file
 
     print('steps per epoch:', steps_per_epoch)
     print('total steps:', total_steps)
@@ -187,8 +197,12 @@ if __name__ == '__main__':
 
     # init model
     print('init model...')
-    model = BertForQuestionAnswering(bert_config)
-    utils.torch_init_model(model, args.init_restore_dir, key='model')
+    if args.pg:
+        model = BertForQA_PG(bert_config, args.rl_weight, args.trainable_weight)
+    else:
+        model = BertForQuestionAnswering(bert_config)
+    # utils.torch_init_model(model, args.init_restore_dir, key='model')
+    utils.torch_init_model(model, args.init_restore_dir, key=None)
     model.to(device)
 
     # Prepare optimizer and schedule (linear warmup and decay)
@@ -213,7 +227,7 @@ if __name__ == '__main__':
         except ImportError:
             raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
         model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
-    optimizer.load_state_dict(torch.load(args.init_restore_dir, map_location='cpu')['opt'])
+    # optimizer.load_state_dict(torch.load(args.init_restore_dir, map_location='cpu')['opt'])
 
     if n_gpu > 1:
         model = torch.nn.DataParallel(model)
@@ -242,21 +256,36 @@ if __name__ == '__main__':
     for i in range(int(args.train_epochs)):
         print('Starting epoch %d' % (i + 1))
         total_loss = 0
+        total_rl = 0
         iteration = 1
         with tqdm(total=steps_per_epoch, desc='Epoch %d' % (i + 1)) as pbar:
             for step, batch in enumerate(train_dataloader):
                 batch = tuple(t.to(device) for t in batch)
                 input_ids, input_mask, segment_ids, start_positions, end_positions = batch
-                loss = model(input_ids, segment_ids, input_mask, start_positions, end_positions)
+                if args.pg:
+                    pg_weight = min((iteration / pg_steps) * args.rl_weight, args.rl_weight)
+                    if args.trainable_weight:
+                        pg_weight = None
+                    loss, rl_loss = model(input_ids, segment_ids, input_mask, start_positions, end_positions,
+                                          pg_weight=pg_weight)
+                else:
+                    loss = model(input_ids, segment_ids, input_mask, start_positions, end_positions)
                 if n_gpu > 1:
                     loss = loss.mean()  # mean() to average on multi-gpu.
+                    if args.pg:
+                        rl_loss = rl_loss.mean()
+
+                if args.pg:
+                    total_rl += rl_loss.item()
+
                 if args.float16:
                     with amp.scale_loss(loss, optimizer) as scaled_loss:
                         scaled_loss.backward()
                 else:
                     loss.backward()
                 total_loss += loss.item()
-                pbar.set_postfix({'loss': '{0:1.5f}'.format(total_loss / (iteration + 1e-5))})
+                pbar.set_postfix({'loss': '{0:1.5f}'.format(total_loss / (iteration + 1e-5)),
+                                  'PG_loss': '{0:1.5f}'.format(total_rl / (iteration + 1e-5))})
                 pbar.update(1)
 
                 if args.float16:

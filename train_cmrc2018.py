@@ -85,10 +85,11 @@ def evaluate(model, args, eval_examples, eval_features, device, global_steps,
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gpu_ids', type=str, default='1')
+    parser.add_argument('--gpu_ids', type=str, default='0')
 
     # training parameter
     parser.add_argument('--train_epochs', type=int, default=3)
+    parser.add_argument('--limit_epochs', type=int, default=1)
     parser.add_argument('--n_batch', type=int, default=16)
     parser.add_argument('--lr', type=float, default=3e-5)
     parser.add_argument('--dropout', type=float, default=0.1)
@@ -123,7 +124,7 @@ if __name__ == '__main__':
     parser.add_argument('--init_restore_dir', type=str,
                         default='pretrained_models/bert-wwm-ext/pytorch_model.bin')
     parser.add_argument('--checkpoint_dir', type=str,
-                        default='check_points/roberta_cmrc2018_V0/')
+                        default='check_points/roberta_cmrc2018_V3/')
     parser.add_argument('--setting_file', type=str, default='setting.txt')
     parser.add_argument('--log_file', type=str, default='log.txt')
 
@@ -242,6 +243,9 @@ if __name__ == '__main__':
         print('Starting epoch %d' % (i + 1))
         total_loss = 0
         iteration = 1
+        if i == args.limit_epochs:
+            print('Stop with {} epochs training'.format(i))
+            break
         with tqdm(total=steps_per_epoch, desc='Epoch %d' % (i + 1)) as pbar:
             for step, batch in enumerate(train_dataloader):
                 batch = tuple(t.to(device) for t in batch)

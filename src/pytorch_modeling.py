@@ -607,6 +607,7 @@ class BertForClassification(PreTrainedBertModel):
         else:
             return logits
 
+
 class BertForQuestionAnswering(PreTrainedBertModel):
     def __init__(self, config):
         super(BertForQuestionAnswering, self).__init__(config)
@@ -639,6 +640,125 @@ class BertForQuestionAnswering(PreTrainedBertModel):
             end_loss = loss_fct(end_logits, end_positions)
             total_loss = (start_loss + end_loss) / 2
             return total_loss
+        else:
+            return start_logits, end_logits
+
+
+import numpy as np
+
+
+class BertForQA_PG(PreTrainedBertModel):
+    def __init__(self, config, rl_weight=0.3, trainable_weight=False):
+        super(BertForQA_PG, self).__init__(config)
+        self.bert = BertModel(config)
+        # TODO check with Google if it's normal there is no dropout on the token classifier of SQuAD in the TF version
+        # self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.qa_outputs = nn.Linear(config.hidden_size, 2)
+        # self.apply(self.init_bert_weights)
+        self.rl_weight = rl_weight
+        self.trainable_weight = trainable_weight
+        if self.trainable_weight:
+            self.sigma_ce = nn.Parameter(torch.tensor(1 / np.sqrt(2), dtype=torch.float32), requires_grad=True)
+            self.sigma_rl = nn.Parameter(torch.tensor(1 / np.sqrt(2), dtype=torch.float32), requires_grad=True)
+
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None,
+                start_positions=None, end_positions=None, pg_weight=None):
+        sequence_output, _ = self.bert(input_ids, token_type_ids, attention_mask, output_all_encoded_layers=False)
+        logits = self.qa_outputs(sequence_output)
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1)
+        end_logits = end_logits.squeeze(-1)
+
+        if start_positions is not None and end_positions is not None:
+            # If we are on multi-GPU, split add a dimension
+            if len(start_positions.size()) > 1:
+                start_positions = start_positions.squeeze(-1)
+            if len(end_positions.size()) > 1:
+                end_positions = end_positions.squeeze(-1)
+            # sometimes the start/end positions are outside our model inputs, we ignore these terms
+            ignored_index = start_logits.size(1)
+            start_positions.clamp_(0, ignored_index)
+            end_positions.clamp_(0, ignored_index)
+
+            # get start-end seqs s:[0,1,0,0,0] e:[0,0,0,0,1] gt:[0,1,1,1,1]
+            batch, length = input_ids.shape[0], input_ids.shape[1]
+            start_onehot = torch.zeros((batch, length), dtype=logits.dtype, device=logits.device). \
+                scatter_(1, start_positions[:, None], 1)
+            end_onehot = torch.zeros((batch, length), dtype=logits.dtype, device=logits.device). \
+                scatter_(1, end_positions[:, None], 1)
+            gt_cumsum_start = torch.cumsum(start_onehot, dim=1)
+            gt_cumsum_end = torch.cumsum(end_onehot, dim=1)
+            gt_cumsum = torch.clamp(gt_cumsum_start - gt_cumsum_end + end_onehot, 0, 1.0)
+
+            # get greed cumsums
+            start_logits_ = start_logits.clone()
+            start_logits_[:, 0] = -20000.0
+            start_logits_ = start_logits_ - (1 - attention_mask) * 20000.0
+            end_logits_ = end_logits.clone()
+            end_logits_[:, 0] = -20000.0
+            end_logits_ = end_logits_ - (1 - attention_mask) * 20000.0
+
+            greed_start = torch.argmax(start_logits_, dim=1)
+            greed_start_onehot = torch.zeros((batch, length), dtype=logits.dtype, device=logits.device). \
+                scatter_(1, greed_start[:, None], 1)
+            greed_cumsum_start = torch.cumsum(greed_start_onehot, dim=1)
+            # mask all pos before start
+            end_logits_2 = end_logits_ - (1 - greed_cumsum_start) * 20000.0  # [b,len]
+            greed_end = torch.argmax(end_logits_2, dim=1)
+            greed_end_onehot = torch.zeros((batch, length), dtype=logits.dtype, device=logits.device). \
+                scatter_(1, greed_end[:, None], 1)
+            greed_cumsum_end = torch.cumsum(greed_end_onehot, dim=1)
+            greed_cumsum = torch.clamp(greed_cumsum_start - greed_cumsum_end + greed_end_onehot, 0, 1.0)
+            greed_tp = torch.sum(torch.clamp(greed_cumsum + gt_cumsum - 1.0, 0, 1.0), dim=1)
+            greed_precision = greed_tp / (torch.sum(greed_cumsum, dim=1) + 1e-6)
+            greed_recall = greed_tp / (torch.sum(gt_cumsum, dim=1) + 1e-6)
+            greed_f1 = (2 * greed_precision * greed_recall) / (greed_precision + greed_recall + 1e-6)
+
+            # get sample cumsums
+            sample_start = torch.multinomial(torch.softmax(start_logits_, dim=1), 1)
+            sample_start_onehot = torch.zeros((batch, length), dtype=logits.dtype, device=logits.device). \
+                scatter_(1, sample_start, 1)
+            sample_cumsum_start = torch.cumsum(sample_start_onehot, dim=1)
+            # mask all pos before start
+            end_logits_2 = end_logits_ - (1 - greed_cumsum_start) * 20000.0  # [b,len]
+            sample_end = torch.multinomial(torch.softmax(end_logits_2, dim=1), 1)
+            sample_end_onehot = torch.zeros((batch, length), dtype=logits.dtype, device=logits.device). \
+                scatter_(1, sample_end, 1)
+            sample_cumsum_end = torch.cumsum(sample_end_onehot, dim=1)
+            sample_cumsum = torch.clamp(sample_cumsum_start - sample_cumsum_end + sample_end_onehot, 0, 1.0)
+            sample_tp = torch.sum(torch.clamp(sample_cumsum + gt_cumsum - 1.0, 0, 1.0), dim=1)
+            sample_precision = sample_tp / (torch.sum(sample_cumsum, dim=1) + 1e-6)
+            sample_recall = greed_tp / (torch.sum(gt_cumsum, dim=1) + 1e-6)
+            sample_f1 = (2 * sample_precision * sample_recall) / (sample_precision + sample_recall + 1e-6)
+
+            # 规范化rewards
+            ML_reward = torch.clamp_min(sample_f1 - greed_f1, 0.).detach()
+            GD_reward = torch.clamp_min(greed_f1 - sample_f1, 0.).detach()
+
+            rl_loss_fct = CrossEntropyLoss(ignore_index=ignored_index, reduction='none')
+            ML_start_loss = rl_loss_fct(start_logits, sample_start.squeeze(-1)) * ML_reward
+            ML_end_loss = rl_loss_fct(end_logits, sample_end.squeeze(-1)) * ML_reward
+            ML_loss = (ML_start_loss.mean() + ML_end_loss.mean()) / 2
+            GD_start_loss = rl_loss_fct(start_logits, greed_start.squeeze(-1)) * GD_reward
+            GD_end_loss = rl_loss_fct(end_logits, greed_end.squeeze(-1)) * GD_reward
+            GD_loss = (GD_start_loss.mean() + GD_end_loss.mean()) / 2
+            RL_loss = ML_loss + GD_loss
+
+            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            total_loss = (start_loss + end_loss) / 2
+            if self.trainable_weight:
+                total_loss = (1 / (2 * (self.sigma_ce ** 2) + 1e-7)) * total_loss + \
+                             (1 / (2 * (self.sigma_rl ** 2) + 1e-7)) * RL_loss + \
+                             torch.log(self.sigma_ce ** 2 + 1e-7) + torch.log(self.sigma_rl ** 2 + 1e-7)
+                return total_loss, (1 / (2 * (self.sigma_rl ** 2) + 1e-7)) * RL_loss
+            elif pg_weight is None:
+                total_loss = total_loss + self.rl_weight * RL_loss
+                return total_loss, self.rl_weight * RL_loss
+            else:
+                total_loss = total_loss + pg_weight * RL_loss
+                return total_loss, pg_weight * RL_loss
         else:
             return start_logits, end_logits
 

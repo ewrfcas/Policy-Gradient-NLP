@@ -5,7 +5,7 @@ import numpy as np
 import json
 import torch
 import utils
-from src.pytorch_modeling import BertForUniLM, BertConfig
+from src.pytorch_modeling import BertForUniLM, BertForUniLM_PolicyGradient, BertConfig
 from src.pytorch_optimization import AdamW, get_linear_schedule_with_warmup
 from src.text_shuffle_preprocess import get_features
 from torch.utils.data import TensorDataset, DataLoader
@@ -209,8 +209,8 @@ def batch_evaluate(model, device, dev_features, dev_steps, result_dir, best_ter=
     if np.mean(ters) > best_ter:
         best_ter = np.mean(ters)
         model_to_save = model.module if hasattr(model, 'module') else model
-        save_dict = {'model':model_to_save.state_dict(),
-                     'opt':optimizer.state_dict()}
+        save_dict = {'model': model_to_save.state_dict(),
+                     'opt': optimizer.state_dict()}
         torch.save(save_dict, args.checkpoint_dir + '/best_model.pth')
     return best_ter
 
@@ -235,6 +235,8 @@ if __name__ == '__main__':
     parser.add_argument('--log_interval', type=int, default=50)
     parser.add_argument('--save_interval', type=int, default=2000)
     parser.add_argument('--vocab_size', type=int, default=13806)  # 21128, 8021, 13806
+    parser.add_argument('--pg', default=False, action='store_true')
+    parser.add_argument('--rl_weight', type=float, default=0.15)
 
     # data dir
     parser.add_argument('--train_dir', type=str, default='data/text_shuffle/train.json')
@@ -242,7 +244,7 @@ if __name__ == '__main__':
     parser.add_argument('--train_feat_dir', type=str, default='data/text_shuffle/train_feat.pkl')
     parser.add_argument('--bert_config_file', type=str, default='pretrained_models/mtsn_base/mtsn_base_config.json')
     parser.add_argument('--init_restore_dir', type=str, default='check_points/mtsn_base_V0/last_model.pth')
-    parser.add_argument('--checkpoint_dir', type=str, default='check_points/mtsn_base_V1')
+    parser.add_argument('--checkpoint_dir', type=str, default='check_points/mtsn_base_V3')
     parser.add_argument('--setting_file', type=str, default='setting.txt')
     parser.add_argument('--log_file', type=str, default='log.txt')
 
@@ -300,7 +302,10 @@ if __name__ == '__main__':
     # init model
     print('init model...')
 
-    model = BertForUniLM(bert_config)
+    if args.pg:
+        model = BertForUniLM_PolicyGradient(bert_config, rl_weight=args.rl_weight, tokenizer=tokenizer)
+    else:
+        model = BertForUniLM(bert_config)
     utils.torch_init_model(model, args.init_restore_dir, key='model')
     model.to(device)
 
@@ -337,8 +342,9 @@ if __name__ == '__main__':
     all_context_mask = torch.tensor([f['context_mask'] for f in train_features], dtype=torch.long)
     all_output_idxs = torch.tensor([f['output_idxs'] for f in train_features], dtype=torch.long)
     all_output_ids = torch.tensor([f['output_ids'] for f in train_features], dtype=torch.long)
+    all_indexs = torch.tensor(torch.arange(0, len(train_features)), dtype=torch.long)
     train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids,
-                               all_context_mask, all_output_idxs, all_output_ids)
+                               all_context_mask, all_output_idxs, all_output_ids, all_indexs)
     train_dataloader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
 
     print('***** Training *****')
@@ -349,15 +355,30 @@ if __name__ == '__main__':
         print('Starting epoch %d' % (i + 1))
         start_time = time.time()
         loss_values = []
+        ce_values = []
+        pg_values = []
         for step, batch in enumerate(train_dataloader):
-            batch = tuple(t.to(device) for t in batch)
+            indexs = batch[-1]
+            texts = [train_features[i]['output_text'] for i in indexs]
+            batch = tuple(t.to(device) for t in batch[:-1])
             input_ids, input_mask, segment_ids, context_mask, output_idx, output_ids = batch
-            loss = model(input_ids=input_ids,
-                         attention_mask=input_mask,
-                         token_type_ids=segment_ids,
-                         context_mask=context_mask,
-                         output_idx=output_idx,
-                         output_ids=output_ids)
+            if args.pg:
+                loss, ce_loss, pg_loss = model(input_ids=input_ids,
+                                               attention_mask=input_mask,
+                                               token_type_ids=segment_ids,
+                                               context_mask=context_mask,
+                                               output_idx=output_idx,
+                                               output_ids=output_ids,
+                                               texts=texts)
+                ce_values.append(ce_loss.item())
+                pg_values.append(pg_loss.item())
+            else:
+                loss = model(input_ids=input_ids,
+                             attention_mask=input_mask,
+                             token_type_ids=segment_ids,
+                             context_mask=context_mask,
+                             output_idx=output_idx,
+                             output_ids=output_ids)
             if n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu.
             loss_values.append(loss.item())
@@ -378,8 +399,8 @@ if __name__ == '__main__':
             global_steps += 1
 
             if global_steps % args.log_interval == 0:
-                show_str = 'Epoch:{}, Steps:{}/{}, Loss:{:.4f}'.format(i + 1, global_steps, total_steps,
-                                                                       np.mean(loss_values))
+                show_str = 'Epoch:{}, Steps:{}/{}, Loss:{:.4f}, CELoss:{:.4f}, PGLoss:{:.4f}'.\
+                    format(i + 1, global_steps, total_steps, np.mean(loss_values), np.mean(ce_values), np.mean(pg_values))
                 if global_steps > 1:
                     remain_seconds = (time.time() - start_time) * ((train_steps - step) / (step + 1e-5))
                     m, s = divmod(remain_seconds, 60)
@@ -401,8 +422,8 @@ if __name__ == '__main__':
         best_ter = batch_evaluate(model, device, dev_features, dev_steps, result_dir, best_ter)
         model.train()
         model_to_save = model.module if hasattr(model, 'module') else model
-        save_dict = {'model':model_to_save.state_dict(),
-                     'opt':optimizer.state_dict()}
+        save_dict = {'model': model_to_save.state_dict(),
+                     'opt': optimizer.state_dict()}
         torch.save(save_dict, args.checkpoint_dir + '/last_model.pth')
 
     print('Best TER:', best_ter)

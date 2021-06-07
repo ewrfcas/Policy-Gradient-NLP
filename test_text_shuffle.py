@@ -10,6 +10,9 @@ from src.pytorch_modeling import BertForUniLMInference, BertConfig
 from tqdm import tqdm
 import src.official_tokenization as tokenization
 import copy
+from rouge import Rouge
+
+rouge = Rouge()
 
 SPIECE_UNDERLINE = '▁'
 
@@ -46,6 +49,26 @@ def is_fuhao(c):
         return True
     return False
 
+def _tokenize_chinese_chars(text):
+    """Adds whitespace around any CJK character."""
+    output = []
+    for char in text:
+        cp = ord(char)
+        if _is_chinese_char(cp) or is_fuhao(char):
+            if len(output) > 0 and output[-1] != SPIECE_UNDERLINE:
+                output.append(SPIECE_UNDERLINE)
+            output.append(char)
+            output.append(SPIECE_UNDERLINE)
+        else:
+            output.append(char)
+    return "".join(output)
+
+
+def is_whitespace(c):
+    if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F or c == SPIECE_UNDERLINE:
+        return True
+    return False
+
 
 # 聚合所有token为最终结果，这里主要处理中英文混合的情况
 def combine_tokens(tokens):
@@ -67,6 +90,55 @@ def combine_tokens(tokens):
 
     output_text = "".join(output_text).strip()
     return output_text
+
+def split_tokens(text):
+    context_chs = _tokenize_chinese_chars(text)
+    doc_tokens = []
+    prev_is_whitespace = True
+    for c in context_chs:
+        if is_whitespace(c):
+            prev_is_whitespace = True
+        else:
+            if prev_is_whitespace:
+                doc_tokens.append(c)
+            else:
+                doc_tokens[-1] += c
+            prev_is_whitespace = False
+    return doc_tokens
+
+
+def get_rouge_score(y_true, y_pred):
+    split_tokens_true = " ".join(y_true).lower()
+    split_tokens_pred = " ".join(y_pred).lower()
+
+    try:
+        rouge_score = rouge.get_scores(split_tokens_pred, split_tokens_true)[0]
+        rouge1 = rouge_score['rouge-1']['f']
+        rouge2 = rouge_score['rouge-2']['f']
+        rougel = rouge_score['rouge-l']['f']
+    except:
+        rouge1 = 0
+        rouge2 = 0
+        rougel = 0
+
+    return rouge1 * 100, rouge2 * 100, rougel * 100
+
+
+def get_ter_score(y_true, y_pred):
+    dp = [[0 for _ in range(len(y_pred) + 1)] for _ in range(len(y_true) + 1)]
+    for i in range(1, len(dp)):
+        dp[i][0] = i
+    for i in range(1, len(dp[0])):
+        dp[0][i] = i
+    for i in range(1, len(dp)):
+        for j in range(1, len(dp[i])):
+            if y_true[i - 1] == y_pred[j - 1]:
+                d = 0
+            else:
+                d = 1
+            dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + d)
+    ter = dp[-1][-1] / (len(y_true) + 1e-5)
+    return (1 - ter) * 100, -dp[-1][-1]
 
 
 # 基于batch的seq2seq推断，单个样本的seq2seq推断会简单很多，但是速度很慢(fp16 torch版本双卡大概XX分钟完成3000样本推断)
@@ -142,7 +214,7 @@ def batch_evaluate(model, device, dev_features, dev_steps, result_dir, END_id=99
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gpu_ids', type=str, default='0')
+    parser.add_argument('--gpu_ids', type=str, default='1')
 
     # training parameter
     parser.add_argument('--eval_batch_size', type=int, default=256)
@@ -155,8 +227,8 @@ if __name__ == '__main__':
     # data dir
     parser.add_argument('--dev_dir', type=str, default='data/text_shuffle/test_with_answer.json')
     parser.add_argument('--bert_config_file', type=str, default='pretrained_models/mtsn_base/mtsn_base_config.json')
-    parser.add_argument('--output_dir', type=str, default='check_points/mtsn_base_V0/output_total.json')
-    parser.add_argument('--checkpoint_dir', type=str, default='check_points/mtsn_base_V0')
+    parser.add_argument('--output_dir', type=str, default='check_points/mtsn_base_V1/output_total.json')
+    parser.add_argument('--checkpoint_dir', type=str, default='check_points/mtsn_base_V3')
     parser.add_argument('--setting_file', type=str, default='setting.txt')
     parser.add_argument('--log_file', type=str, default='log.txt')
 
@@ -209,3 +281,45 @@ if __name__ == '__main__':
     # evaluate
     model.eval()
     batch_evaluate(model, device, dev_features, dev_steps, args.output_dir)
+
+    gts = json.load(open(args.dev_dir))
+    gt_dict = {}
+    for d in gts:
+        gt_dict[d['idx']] = d['origin']
+
+    preds = json.load(open(args.output_dir))
+    pred_dict = {}
+    for d in preds:
+        pred_dict[int(d['idx'])] = d['generate']
+
+    rouge1_scores = []
+    rouge2_scores = []
+    rougel_scores = []
+    ters = []
+    missing = 0
+    m_ters = []
+    for idx in tqdm(gt_dict):
+        if idx not in pred_dict:
+            missing += 1
+            rouge1_scores.append(0.0)
+            rouge2_scores.append(0.0)
+            rougel_scores.append(0.0)
+        else:
+            y_true = split_tokens(gt_dict[idx])
+            y_true = [y.strip().lower() for y in y_true]
+            y_pred = split_tokens(pred_dict[idx])
+            y_pred = [y.strip().lower() for y in y_pred]
+            r1, r2, rl = get_rouge_score(y_true, y_pred)
+            rouge1_scores.append(r1)
+            rouge2_scores.append(r2)
+            rougel_scores.append(rl)
+            ter_score, m_ter = get_ter_score(y_true, y_pred)
+            ters.append(ter_score)
+            m_ters.append(m_ter)
+
+    print('Rouge-1:', np.mean(rouge1_scores))
+    print('Rouge-2:', np.mean(rouge2_scores))
+    print('Rouge-L:', np.mean(rougel_scores))
+    print('TER score:', np.mean(ters))
+    print('Minus TER:', np.mean(m_ters))
+    print('Missing:', missing)
